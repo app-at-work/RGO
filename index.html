@@ -627,7 +627,7 @@ async function withLoad(msg,fn){loadShow(msg);try{return await fn()}finally{load
 const paint=()=>new Promise(r=>requestAnimationFrame(()=>setTimeout(r,20)));
 document.addEventListener('keydown',e=>{if(LD.n>0){e.preventDefault();e.stopImmediatePropagation()}},true);
 
-/* ======================= BANCO DE DADOS ======================= */
+/* ======================= SUPABASE ======================= */
 async function api(path,opt={}){
   if(!navigator.onLine){const er=new Error('Sem conexão');er.net=true;throw er}
   const h={apikey:SB_KEY,Authorization:'Bearer '+SB_KEY,'Content-Type':'application/json',...(opt.headers||{})};
@@ -644,7 +644,7 @@ async function api(path,opt={}){
 /* ======================= LEITURA FIEL =======================
    Paginação por CHAVE (num/id) em vez de OFFSET: edições, inserções ou exclusões
    feitas durante a leitura não deslocam páginas (causa de linhas duplicadas/faltando).
-   Funciona com qualquer limite máximo de linhas da API. */
+   Funciona com qualquer limite "Max rows" do Supabase. */
 const PG=1000;
 async function keyset(t,sel,key,from,to){
   const out=[];let last=from;
@@ -660,7 +660,7 @@ async function keyset(t,sel,key,from,to){
   }
   return out;
 }
-async function fetchRegs(onProgress){
+async function fetchRegs(){
   try{
     const top=await api(`${T_REG}?select=num&order=num.desc&limit=1`,{raw:true,headers:{Prefer:'count=exact'}});
     const total=+((top.headers.get('content-range')||'').split('/')[1])||0;
@@ -669,18 +669,13 @@ async function fetchRegs(onProgress){
     const lo=await api(`${T_REG}?select=num&order=num.asc&limit=1`);
     const min=+(lo&&lo[0]?lo[0].num:1);
     const W=PG,wins=[];for(let a=min-1;a<max;a+=W)wins.push([a,Math.min(a+W,max)]);
-    const parts=new Array(wins.length);let nx=0,loaded=0;
-    if(onProgress)onProgress(0,total);
-    const worker=async()=>{while(nx<wins.length){
-      const i=nx++;parts[i]=await keyset(T_REG,SEL,'num',wins[i][0],wins[i][1]);
-      loaded+=parts[i].length;if(onProgress)onProgress(Math.min(loaded,total),total);
-    }};
+    const parts=new Array(wins.length);let nx=0;
+    const worker=async()=>{while(nx<wins.length){const i=nx++;parts[i]=await keyset(T_REG,SEL,'num',wins[i][0],wins[i][1])}};
     await Promise.all(Array.from({length:Math.min(4,wins.length)},worker));
     return {rows:parts.flat(),total};
   }catch(e){
     if(e.code!=='42703'&&!/num/.test(e.message||''))throw e;
     const rows=await keyset(T_REG,SEL.replace('id,num,','id,'),'id',null,null);
-    if(onProgress)onProgress(rows.length,rows.length);
     return {rows,total:rows.length};
   }
 }
@@ -848,15 +843,10 @@ async function doLoad(seq){
   try{
     const [recent,lst]=await Promise.all([fetchRecentRegs(),keyset(T_LST,'select=id,campo,valor','id',null,null)]);
     if(seq!==loadSeq)return;
-    /* Libera o loading antes da renderização para projetar os 7 dias imediatamente. */
-    st.loading=false;applyServer(recent,lst,ts,false);
-    perf.load=Math.round(performance.now()-t0);loadHide();
-    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-    if(seq!==loadSeq)return;
-    conn('on',`Últimos 7 dias carregados · ${recent.rows.length} registro(s)`);
-    const startHistory=()=>{if(seq===loadSeq)void loadHistory(seq,lst,ts)};
-    if('requestIdleCallback' in window)requestIdleCallback(startHistory,{timeout:1800});
-    else setTimeout(startHistory,1200);
+    applyServer(recent,lst,ts,false);st.loading=false;perf.load=Math.round(performance.now()-t0);loadHide();
+    conn('busy','Carregando histórico em segundo plano...');
+    /* Não aguardado de propósito: a tela fica liberada após os 7 dias. */
+    void loadHistory(seq,lst,ts);
   }catch(e){
     loadHide();st.loading=false;st.ok=false;
     if(e.net){online=false;clearTimeout(retryT);retryT=setTimeout(drain,10000)}
@@ -864,17 +854,11 @@ async function doLoad(seq){
     inval();setSave();renderAll();
   }
 }
-function historyProgress(done,total){
-  const pct=total?Math.min(100,Math.round(done*100/total)):0;
-  conn('busy',`Histórico em segundo plano · ${pct}%`);
-  const f=$('#fInfo');if(f)f.textContent=`Exibindo ${st.rows.length.toLocaleString('pt-BR')} registro(s) · Carregando histórico: ${pct}%`;
-}
 async function loadHistory(seq,lst,ts){
   try{
-    historyProgress(0,1);
-    let res=await fetchRegs(historyProgress);if(seq!==loadSeq)return;
+    let res=await fetchRegs();if(seq!==loadSeq)return;
     let srv=dedupe(res.rows);
-    if(srv.size!==res.total){res=await fetchRegs(historyProgress);if(seq!==loadSeq)return;srv=dedupe(res.rows)}
+    if(srv.size!==res.total){res=await fetchRegs();if(seq!==loadSeq)return;srv=dedupe(res.rows)}
     applyServer(res,lst,ts,true);perf.load=Math.round(performance.now()-ts);
     if(srv.size!==res.total)toast(`Atenção: lidas ${srv.size} de ${res.total} linhas do banco. Clique em Atualizar.`,true);
     else toast(`Base completa carregada: ${srv.size} registro(s).`);
@@ -1516,13 +1500,13 @@ function toISO(v){
 }
 
 /* ======================= IMPORTAÇÃO COLETIVA ======================= */
-let impRows=[],impName='',job=null;
+let impRows=[],impName='',job=null,impDup={arquivo:0,banco:0};
 function stepsHTML(s){
   const it=[['Baixar modelo','Planilha padrão (opcional)'],['Selecionar arquivo','.xlsx ou .csv'],['Importar','Envio ao banco']];
   return `<div class="steps">${it.map((x,i)=>`<div class="stp ${i+1===s?'on':i+1<s?'ok':''}"><span class="n">${i+1<s?'✓':i+1}</span><div><b>${x[0]}</b><small>${x[1]}</small></div></div>`).join('')}</div>`;
 }
 function openImport(){
-  impRows=[];impName='';
+  impRows=[];impName='';impDup={arquivo:0,banco:0};
   openModal(`<header><div><h2>Importação coletiva</h2><p>Envie vários registros de uma vez para o banco.</p></div><button type="button" class="ib" data-close id="impX" aria-label="Fechar">${I.x}</button></header>
     <div class="bd"><div id="stpW">${stepsHTML(1)}</div>
       <div id="impPick">
@@ -1543,7 +1527,26 @@ function openImport(){
 }
 $('#bImp').addEventListener('click',openImport);
 $('#fImp').addEventListener('change',e=>{const f=e.target.files[0];if(f)readFile(f);e.target.value=''});
-async function readFile(file){return withLoad('Lendo arquivo...',()=>readFile0(file))}
+/* Assinatura de duplicidade: compara todos os campos de dados, ignorando ID e data de criação.
+   Textos são aparados, listas são normalizadas em maiúsculas e datas em ISO. */
+function dupSig(r){return FIELDS.map(k=>{
+  let v=r[k];if(v==null)return '';
+  if(k==='data')return String(v).slice(0,10);
+  v=String(v).trim();
+  if(['mina','categoria','setores','lancamento'].includes(k))v=UP(v);
+  return v;
+}).join('\u001f')}
+async function removeImportDuplicates(rows){
+  const unique=[],seen=new Set();let arquivo=0,banco=0;
+  for(const r of rows){const k=dupSig(r);if(seen.has(k)){arquivo++;continue}seen.add(k);unique.push(r)}
+  /* Busca a base completa no momento da conferência para não depender somente das linhas
+     que já estão visíveis na tabela enquanto o histórico carrega em segundo plano. */
+  const existing=await fetchRegs();
+  const db=new Set(existing.rows.map(dupSig));
+  const clean=[];for(const r of unique){if(db.has(dupSig(r)))banco++;else clean.push(r)}
+  return {rows:clean,arquivo,banco};
+}
+async function readFile(file){return withLoad('Lendo e verificando duplicidades...',()=>readFile0(file))}
 async function readFile0(file){
   const pv=$('#impPv');if(pv)pv.innerHTML='<div class="note" style="background:var(--pl);color:var(--p)">Lendo arquivo...</div>';
   try{
@@ -1570,7 +1573,9 @@ async function readFile0(file){
         out.push(r);
       }
     });
-    impRows=out;impName=file.name;showPreview(warn,bad);
+    const checked=await removeImportDuplicates(out);
+    impRows=checked.rows;impDup={arquivo:checked.arquivo,banco:checked.banco};
+    impName=file.name;showPreview(warn,bad);
   }catch(err){if(pv)pv.innerHTML='';toast('Erro ao ler arquivo: '+err.message,true)}
 }
 function showPreview(warn,bad){
@@ -1579,13 +1584,17 @@ function showPreview(warn,bad){
   const sd=impRows.filter(r=>!r.data).length;
   $('#stpW').innerHTML=stepsHTML(impRows.length?3:2);
   pv.innerHTML=`<div class="tplc" style="margin:12px 0 0"><span class="fi" style="background:var(--p)">✓</span><div><b>${esc(impName)}</b><small>Arquivo lido com sucesso</small></div><button type="button" class="btn sm" id="impOther">Trocar arquivo</button></div>
-    <div class="kpis"><div class="kpi main"><b>${impRows.length.toLocaleString('pt-BR')}</b><span>linhas para importar</span></div>${Object.keys(g).sort(cmp).slice(0,7).map(k=>`<div class="kpi"><b>${g[k]}</b><span>${esc(k)}</span></div>`).join('')}</div>
+    <div class="kpis"><div class="kpi main"><b>${impRows.length.toLocaleString('pt-BR')}</b><span>linhas únicas para importar</span></div>
+      <div class="kpi ${impDup.arquivo?'bad':''}"><b>${impDup.arquivo.toLocaleString('pt-BR')}</b><span>duplicadas no arquivo</span></div>
+      <div class="kpi ${impDup.banco?'bad':''}"><b>${impDup.banco.toLocaleString('pt-BR')}</b><span>já existentes no banco</span></div>
+      ${Object.keys(g).sort(cmp).slice(0,7).map(k=>`<div class="kpi"><b>${g[k]}</b><span>${esc(k)}</span></div>`).join('')}</div>
     ${impRows.length?`<div class="pvw"><table class="pv"><thead><tr>${COLS.map(c=>`<th>${esc(c.t)}</th>`).join('')}</tr></thead><tbody>${impRows.slice(0,5).map(r=>`<tr>${COLS.map(c=>`<td title="${esc(r[c.k])}">${esc(c.type==='date'?fmtD(r[c.k]):r[c.k])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`:''}
+    ${(impDup.arquivo||impDup.banco)?`<div class="note">⚠ ${impDup.arquivo+impDup.banco} registro(s) duplicado(s) foram retirados da importação. A comparação considera todos os campos da linha.</div>`:''}
     ${bad?`<div class="note">⚠ ${bad} data(s) em formato inválido serão importadas em branco.</div>`:sd?`<div class="note">⚠ ${sd} linha(s) sem DATA serão importadas sem data.</div>`:''}
     ${!impRows.length?'<div class="note">⚠ Nenhuma linha preenchida foi encontrada.</div>':''}
     ${warn.map(w=>`<div class="note">⚠ ${esc(w)}</div>`).join('')}`;
   $('#impPick').style.display='none';
-  $('#impOther').addEventListener('click',()=>{impRows=[];pv.innerHTML='';$('#impPick').style.display='';$('#stpW').innerHTML=stepsHTML(2);setImpBtn()});
+  $('#impOther').addEventListener('click',()=>{impRows=[];impDup={arquivo:0,banco:0};pv.innerHTML='';$('#impPick').style.display='';$('#stpW').innerHTML=stepsHTML(2);setImpBtn()});
   setImpBtn();
 }
 function setImpBtn(){const b=$('#bDoImp');if(!b)return;b.disabled=!impRows.length;b.className='btn pri';b.textContent=impRows.length?`Importar ${impRows.length.toLocaleString('pt-BR')} linha(s)`:'Importar'}
@@ -1645,7 +1654,7 @@ function showResult(res){
     ${pn?`<div class="kpi bad"><b>${pn}</b><span>não enviadas (cancelado)</span></div>`:''}
     <div class="kpi"><b>${sec}s</b><span>tempo total</span></div></div>
     ${res.fail.length?`<div class="note">⚠ ${res.fail.length} linha(s) foram recusadas pelo banco. Baixe, corrija e importe novamente.<button type="button" class="btn sm" id="dlErr" style="margin-left:auto">${I.dl}Baixar linhas com erro</button></div>`:''}`;
-  $('#impX').style.visibility='';impRows=[];
+  $('#impX').style.visibility='';impRows=[];impDup={arquivo:0,banco:0};
   const b=$('#bDoImp'),nb=b.cloneNode(false);nb.className='btn pri';nb.textContent='Concluir';nb.disabled=false;b.replaceWith(nb);
   nb.addEventListener('click',()=>closeModal(true));
   if(res.fail.length)$('#dlErr').addEventListener('click',()=>{
