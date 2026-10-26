@@ -627,7 +627,7 @@ async function withLoad(msg,fn){loadShow(msg);try{return await fn()}finally{load
 const paint=()=>new Promise(r=>requestAnimationFrame(()=>setTimeout(r,20)));
 document.addEventListener('keydown',e=>{if(LD.n>0){e.preventDefault();e.stopImmediatePropagation()}},true);
 
-/* ======================= SUPABASE ======================= */
+/* ======================= BANCO DE DADOS ======================= */
 async function api(path,opt={}){
   if(!navigator.onLine){const er=new Error('Sem conexão');er.net=true;throw er}
   const h={apikey:SB_KEY,Authorization:'Bearer '+SB_KEY,'Content-Type':'application/json',...(opt.headers||{})};
@@ -644,7 +644,7 @@ async function api(path,opt={}){
 /* ======================= LEITURA FIEL =======================
    Paginação por CHAVE (num/id) em vez de OFFSET: edições, inserções ou exclusões
    feitas durante a leitura não deslocam páginas (causa de linhas duplicadas/faltando).
-   Funciona com qualquer limite "Max rows" do Supabase. */
+   Funciona com qualquer limite máximo de linhas da API. */
 const PG=1000;
 async function keyset(t,sel,key,from,to){
   const out=[];let last=from;
@@ -660,7 +660,7 @@ async function keyset(t,sel,key,from,to){
   }
   return out;
 }
-async function fetchRegs(){
+async function fetchRegs(onProgress){
   try{
     const top=await api(`${T_REG}?select=num&order=num.desc&limit=1`,{raw:true,headers:{Prefer:'count=exact'}});
     const total=+((top.headers.get('content-range')||'').split('/')[1])||0;
@@ -669,13 +669,18 @@ async function fetchRegs(){
     const lo=await api(`${T_REG}?select=num&order=num.asc&limit=1`);
     const min=+(lo&&lo[0]?lo[0].num:1);
     const W=PG,wins=[];for(let a=min-1;a<max;a+=W)wins.push([a,Math.min(a+W,max)]);
-    const parts=new Array(wins.length);let nx=0;
-    const worker=async()=>{while(nx<wins.length){const i=nx++;parts[i]=await keyset(T_REG,SEL,'num',wins[i][0],wins[i][1])}};
+    const parts=new Array(wins.length);let nx=0,loaded=0;
+    if(onProgress)onProgress(0,total);
+    const worker=async()=>{while(nx<wins.length){
+      const i=nx++;parts[i]=await keyset(T_REG,SEL,'num',wins[i][0],wins[i][1]);
+      loaded+=parts[i].length;if(onProgress)onProgress(Math.min(loaded,total),total);
+    }};
     await Promise.all(Array.from({length:Math.min(4,wins.length)},worker));
     return {rows:parts.flat(),total};
   }catch(e){
     if(e.code!=='42703'&&!/num/.test(e.message||''))throw e;
     const rows=await keyset(T_REG,SEL.replace('id,num,','id,'),'id',null,null);
+    if(onProgress)onProgress(rows.length,rows.length);
     return {rows,total:rows.length};
   }
 }
@@ -731,7 +736,7 @@ function setSave(){
   }
   if(bn.classList.contains('off'))bn.className='banner';
   if(n){conn('busy','Sincronizando...');$('#sSave').innerHTML=`<i class="dot busy"></i>Sincronizando ${n} alteração(ões)...`}
-  else{if(st.ok)conn('on','Supabase conectado');$('#sSave').innerHTML=`<i class="dot on"></i>Tudo sincronizado · ${new Date().toLocaleTimeString('pt-BR')}`}
+  else{if(st.ok)conn('on','Banco conectado');$('#sSave').innerHTML=`<i class="dot on"></i>Tudo sincronizado · ${new Date().toLocaleTimeString('pt-BR')}`}
 }
 function enqueue(job){OUT.push(job);setSave();drain()}
 function drain(){return dP||(dP=runQ().finally(()=>{dP=null}))}
@@ -843,35 +848,33 @@ async function doLoad(seq){
   try{
     const [recent,lst]=await Promise.all([fetchRecentRegs(),keyset(T_LST,'select=id,campo,valor','id',null,null)]);
     if(seq!==loadSeq)return;
-    /* IMPORTANTE: libera o estado de loading ANTES de renderizar.
-       Antes, applyServer() chamava renderAll() com st.loading=true e a tabela
-       continuava mostrando o esqueleto até o histórico completo terminar. */
-    st.loading=false;
-    applyServer(recent,lst,ts,false);
-    perf.load=Math.round(performance.now()-t0);
-    loadHide();
-
-    /* Garante que os últimos 7 dias sejam pintados na tabela antes da carga histórica. */
+    /* Libera o loading antes da renderização para projetar os 7 dias imediatamente. */
+    st.loading=false;applyServer(recent,lst,ts,false);
+    perf.load=Math.round(performance.now()-t0);loadHide();
     await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
     if(seq!==loadSeq)return;
     conn('on',`Últimos 7 dias carregados · ${recent.rows.length} registro(s)`);
-
-    /* O restante só começa quando o navegador estiver livre, sem modal e sem bloquear a tabela. */
-    const startHistory=()=>{if(seq===loadSeq){conn('busy','Carregando histórico em segundo plano...');void loadHistory(seq,lst,ts)}};
+    const startHistory=()=>{if(seq===loadSeq)void loadHistory(seq,lst,ts)};
     if('requestIdleCallback' in window)requestIdleCallback(startHistory,{timeout:1800});
     else setTimeout(startHistory,1200);
   }catch(e){
     loadHide();st.loading=false;st.ok=false;
     if(e.net){online=false;clearTimeout(retryT);retryT=setTimeout(drain,10000)}
-    else{conn('err','Erro');$('#bSqlB').style.display='';$('#bRetry').style.display='';$('#bannerTx').textContent=(e.code==='42P01'||e.code==='PGRST205'||e.status===404)?'As tabelas "registro_operacional" e "registro_listas" não existem no Supabase. Execute o SQL de criação e clique em Tentar novamente.':'Falha ao carregar do Supabase: '+e.message;$('#banner').className='banner show'}
+    else{conn('err','Erro');$('#bSqlB').style.display='';$('#bRetry').style.display='';$('#bannerTx').textContent=(e.code==='42P01'||e.code==='PGRST205'||e.status===404)?'As tabelas "registro_operacional" e "registro_listas" não existem no banco. Execute o SQL de criação e clique em Tentar novamente.':'Falha ao carregar os dados: '+e.message;$('#banner').className='banner show'}
     inval();setSave();renderAll();
   }
 }
+function historyProgress(done,total){
+  const pct=total?Math.min(100,Math.round(done*100/total)):0;
+  conn('busy',`Histórico em segundo plano · ${pct}%`);
+  const f=$('#fInfo');if(f)f.textContent=`Exibindo ${st.rows.length.toLocaleString('pt-BR')} registro(s) · Carregando histórico: ${pct}%`;
+}
 async function loadHistory(seq,lst,ts){
   try{
-    let res=await fetchRegs();if(seq!==loadSeq)return;
+    historyProgress(0,1);
+    let res=await fetchRegs(historyProgress);if(seq!==loadSeq)return;
     let srv=dedupe(res.rows);
-    if(srv.size!==res.total){res=await fetchRegs();if(seq!==loadSeq)return;srv=dedupe(res.rows)}
+    if(srv.size!==res.total){res=await fetchRegs(historyProgress);if(seq!==loadSeq)return;srv=dedupe(res.rows)}
     applyServer(res,lst,ts,true);perf.load=Math.round(performance.now()-ts);
     if(srv.size!==res.total)toast(`Atenção: lidas ${srv.size} de ${res.total} linhas do banco. Clique em Atualizar.`,true);
     else toast(`Base completa carregada: ${srv.size} registro(s).`);
@@ -1150,7 +1153,7 @@ $('#tb').addEventListener('click',async e=>{
     st.rows.splice(idx+1,0,nr);invCopy();insertJob(nr);renderTabs();render();flash(nr.id);toast(online?'Linha duplicada':'Linha duplicada (será sincronizada quando houver sinal)');
     return;
   }
-  const ok=await confirmDel({title:'Excluir registro?',msg:'Esta ação remove a linha do Supabase e não pode ser desfeita.',ok:'Excluir registro',
+  const ok=await confirmDel({title:'Excluir registro?',msg:'Esta ação remove a linha do banco e não pode ser desfeita.',ok:'Excluir registro',
     detail:[['ID',row.num!=null?'#'+row.num:'(aguardando sincronização)'],['Data',fmtD(row.data)||'—'],['Mina',row.mina||'—'],['Categoria',row.categoria||'—'],['Setores',row.setores||'—'],['Lançamento',row.lancamento||'—']]});
   if(!ok)return;
   delete pend[id];clearTimeout(timers[id]);GONE.add(id);
@@ -1283,7 +1286,7 @@ dpEl.addEventListener('keydown',e=>{if(e.key==='Escape'&&POP){e.stopPropagation(
 function openEditor(r,c,t,caret){
   if($('#ov').classList.contains('show'))return;
   const meta=[['ID',r.num!=null?'#'+r.num:null],['Data',fmtD(r.data)],['Mina',r.mina],['Categoria',r.categoria],['Setores',r.setores],['Lançamento',r.lancamento]].filter(x=>x[1]);
-  openModal(`<header><div><h2>${esc(c.t)}</h2><p>As alterações são sincronizadas automaticamente com o Supabase.</p></div><button type="button" class="ib" data-close aria-label="Fechar">${I.x}</button></header>
+  openModal(`<header><div><h2>${esc(c.t)}</h2><p>As alterações são sincronizadas automaticamente com o banco.</p></div><button type="button" class="ib" data-close aria-label="Fechar">${I.x}</button></header>
     <div class="bd ed"><div class="meta">${meta.map(([k,v])=>`<span class="tag"><i></i>${esc(k)}: ${esc(v)}</span>`).join('')}</div>
       <textarea id="edT" aria-label="${esc(c.t)}" placeholder="Digite..."></textarea>
       <div class="ei2"><span><kbd>Ctrl</kbd>+<kbd>Enter</kbd> concluir · <kbd>Esc</kbd> fechar</span><span id="edN"></span></div></div>
@@ -1326,7 +1329,7 @@ document.addEventListener('keydown',e=>{
   if($('#ov').classList.contains('show'))closeModal();else if($('#dw').classList.contains('show'))closeDrawer();
 });
 $('#bSqlB').addEventListener('click',()=>{
-  openModal(`<header><div><h2>SQL de criação</h2><p>Execute em Supabase › SQL Editor › New query › Run</p></div><button type="button" class="ib" data-close aria-label="Fechar">${I.x}</button></header>
+  openModal(`<header><div><h2>SQL de criação</h2><p>Execute no editor SQL do banco.</p></div><button type="button" class="ib" data-close aria-label="Fechar">${I.x}</button></header>
     <div class="bd"><pre class="sql">${esc(SQL)}</pre></div>
     <footer><button type="button" class="btn" id="cpSql">Copiar SQL</button><button type="button" class="btn pri" data-close>Fechar</button></footer>`);
   $('#cpSql').addEventListener('click',()=>navigator.clipboard.writeText(SQL).then(()=>toast('SQL copiado'),()=>toast('Não foi possível copiar',true)));
@@ -1515,12 +1518,12 @@ function toISO(v){
 /* ======================= IMPORTAÇÃO COLETIVA ======================= */
 let impRows=[],impName='',job=null;
 function stepsHTML(s){
-  const it=[['Baixar modelo','Planilha padrão (opcional)'],['Selecionar arquivo','.xlsx ou .csv'],['Importar','Envio ao Supabase']];
+  const it=[['Baixar modelo','Planilha padrão (opcional)'],['Selecionar arquivo','.xlsx ou .csv'],['Importar','Envio ao banco']];
   return `<div class="steps">${it.map((x,i)=>`<div class="stp ${i+1===s?'on':i+1<s?'ok':''}"><span class="n">${i+1<s?'✓':i+1}</span><div><b>${x[0]}</b><small>${x[1]}</small></div></div>`).join('')}</div>`;
 }
 function openImport(){
   impRows=[];impName='';
-  openModal(`<header><div><h2>Importação coletiva</h2><p>Envie vários registros de uma vez para o Supabase.</p></div><button type="button" class="ib" data-close id="impX" aria-label="Fechar">${I.x}</button></header>
+  openModal(`<header><div><h2>Importação coletiva</h2><p>Envie vários registros de uma vez para o banco.</p></div><button type="button" class="ib" data-close id="impX" aria-label="Fechar">${I.x}</button></header>
     <div class="bd"><div id="stpW">${stepsHTML(1)}</div>
       <div id="impPick">
         <div class="tplc"><span class="fi">XLSX</span><div><b>Modelo_Importacao_Registro_Operacional.xlsx</b><small>Planilha em branco com as colunas, listas suspensas e instruções</small></div><button type="button" class="btn soft" id="mTpl">${I.dl}<span class="tx">Baixar modelo</span></button></div>
@@ -1614,7 +1617,7 @@ function updRun(){
   const pct=Math.round((job.ok+job.fail.length)/job.total*100);
   const sec=(performance.now()-job.t0)/1000,rate=job.ok/Math.max(sec,.1);
   el.innerHTML=`<div class="run"><div class="rt"><span><b>${job.ok.toLocaleString('pt-BR')}</b> de ${job.total.toLocaleString('pt-BR')} gravadas${job.fail.length?` · <span style="color:var(--dng)">${job.fail.length} com erro</span>`:''}${job.retries?` · ${job.retries} retentativa(s)`:''}</span><span>${pct}% · ${Math.round(rate)} linhas/s</span></div>
-    <div class="prog"><i style="width:${pct}%"></i></div><div class="rs">${esc(job.status||(job.cancel?'Cancelando após os lotes em andamento...':'Enviando lotes ao Supabase...'))}</div></div>`;
+    <div class="prog"><i style="width:${pct}%"></i></div><div class="rs">${esc(job.status||(job.cancel?'Cancelando após os lotes em andamento...':'Enviando lotes ao banco...'))}</div></div>`;
 }
 async function doImport(){
   if(!impRows.length||job)return;
