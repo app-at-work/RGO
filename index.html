@@ -329,8 +329,17 @@ tbody tr:hover td.act .ib,tbody tr.sel td.act .ib,td.act .ib:focus-visible{opaci
 .run .rs{font-size:12px;color:var(--mu);min-height:16px}
 pre.sql{background:var(--hov);border:1px solid var(--bd);border-radius:12px;padding:12px;max-height:360px;overflow:auto;font-size:12px;white-space:pre}
 
+/* Loading em tela inteira */
+.ldov{position:fixed;inset:0;z-index:300;display:none;align-items:center;justify-content:center;padding:16px;background:rgba(8,26,25,.55);backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px);cursor:progress}
+.ldov.show{display:flex;animation:ldin .18s ease}
+@keyframes ldin{from{opacity:0}}
+.ldbox{display:flex;flex-direction:column;align-items:center;gap:18px;background:var(--card);border:1px solid var(--bd);border-radius:22px;padding:30px 42px;min-width:230px;max-width:calc(100vw - 32px);text-align:center;box-shadow:var(--sh3);animation:mi .2s cubic-bezier(.2,.9,.3,1.15)}
+.ldbox b{font-size:15px;font-weight:700;color:var(--tx)}
+.spin{width:56px;height:56px;border-radius:50%;border:5px solid var(--pl2);border-top-color:var(--p);border-right-color:var(--p2);animation:spn .8s linear infinite}
+@keyframes spn{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin{animation-duration:1.8s}}
 /* Toast */
-.toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:220}
+.toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:320}
 .toast{position:relative;display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--bd);padding:12px 16px 12px 12px;border-radius:13px;box-shadow:var(--sh3);animation:tin .25s cubic-bezier(.2,.9,.3,1.2);max-width:380px;overflow:hidden;font-size:13.5px}
 .toast .ti{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--pl);color:var(--ok);flex-shrink:0}
 .toast.err .ti{background:var(--dngl);color:var(--dng)}
@@ -405,6 +414,7 @@ pre.sql{background:var(--hov);border:1px solid var(--bd);border-radius:12px;padd
 <input type="file" id="fImp" accept=".xlsx,.csv" hidden>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div class="hint" id="hint" role="tooltip"></div>
+<div class="ldov" id="ldov" role="alertdialog" aria-modal="true" aria-busy="true" aria-labelledby="ldT"><div class="ldbox"><div class="spin" aria-hidden="true"></div><b id="ldT">Carregando últimos 7 dias...</b></div></div>
 
 <script>
 (function(){
@@ -610,6 +620,12 @@ function toast(m,err){
   setTimeout(()=>{t.classList.add('out');setTimeout(()=>t.remove(),200)},dur);
 }
 function conn(s,tx){$('#dConn').className='dot '+s;$('#tConn').textContent=tx}
+const LD={n:0,t0:0,tm:null};
+function loadShow(msg){LD.n++;$('#ldT').textContent=msg||'Carregando...';if(LD.n===1){clearTimeout(LD.tm);LD.t0=performance.now();$('#ldov').classList.add('show')}}
+function loadHide(){if(LD.n>0)LD.n--;if(LD.n>0)return;clearTimeout(LD.tm);const w=Math.max(0,350-(performance.now()-LD.t0));LD.tm=setTimeout(()=>{if(!LD.n)$('#ldov').classList.remove('show')},w)}
+async function withLoad(msg,fn){loadShow(msg);try{return await fn()}finally{loadHide()}}
+const paint=()=>new Promise(r=>requestAnimationFrame(()=>setTimeout(r,20)));
+document.addEventListener('keydown',e=>{if(LD.n>0){e.preventDefault();e.stopImmediatePropagation()}},true);
 
 /* ======================= SUPABASE ======================= */
 async function api(path,opt={}){
@@ -662,6 +678,33 @@ async function fetchRegs(){
     const rows=await keyset(T_REG,SEL.replace('id,num,','id,'),'id',null,null);
     return {rows,total:rows.length};
   }
+}
+/* Primeira etapa: somente os 7 dias corridos mais recentes pelo campo DATA.
+   O histórico completo é carregado depois, sem bloquear a tela. */
+function localISO(d){const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');return `${y}-${m}-${day}`}
+async function fetchRecentRegs(){
+  const d=new Date();d.setHours(0,0,0,0);d.setDate(d.getDate()-6);
+  const cutoff=localISO(d),out=[];let last=null;
+  try{
+    for(;;){
+      let q=`${T_REG}?${SEL}&data=gte.${cutoff}&order=num.asc&limit=${PG}`;
+      if(last!=null)q+=`&num=gt.${encodeURIComponent(last)}`;
+      const b=await api(q,{timeout:60000})||[];
+      if(!b.length)break;out.push(...b);last=b[b.length-1].num;
+      if(b.length<PG)break;
+    }
+  }catch(e){
+    if(e.code!=='42703'&&!/num/.test(e.message||''))throw e;
+    let lid=null;
+    for(;;){
+      let q=`${T_REG}?${SEL.replace('id,num,','id,')}&data=gte.${cutoff}&order=id.asc&limit=${PG}`;
+      if(lid!=null)q+=`&id=gt.${encodeURIComponent(lid)}`;
+      const b=await api(q,{timeout:60000})||[];
+      if(!b.length)break;out.push(...b);lid=b[b.length-1].id;
+      if(b.length<PG)break;
+    }
+  }
+  return {rows:out,total:out.length,cutoff};
 }
 const dedupe=rows=>{const m=new Map();for(const r of rows)if(r&&r.id!=null)m.set(r.id,r);return m};
 const byDefault=(a,b)=>{
@@ -772,49 +815,71 @@ addEventListener('beforeunload',e=>{if(pendingN()||importing){e.preventDefault()
 /* ======================= CARGA ======================= */
 const SEL='select=id,num,'+FIELDS.join(',')+',created_at';
 const GONE=new Set();
-let loadP=null,nextP=null;
+let loadP=null,nextP=null,loadSeq=0;
 function load(){
   if(loadP){if(!nextP)nextP=loadP.then(()=>{nextP=null;return load()});return nextP}
-  loadP=doLoad().finally(()=>{loadP=null});return loadP;
+  const seq=++loadSeq;
+  loadP=doLoad(seq).finally(()=>{loadP=null});return loadP;
 }
-async function doLoad(){
-  if(st.loading)render();
-  conn('busy','Carregando...');
-  const t0=performance.now(),ts=Date.now();
+function applyServer(res,lst,ts,isFull){
+  const srv=dedupe(res.rows),patches={},dels=new Set(GONE);
+  OUT.forEach(j=>{if(j.t==='patch')patches[j.id]=Object.assign(patches[j.id]||{},j.p);if(j.t==='del')dels.add(j.id)});
+  for(const id in pend)patches[id]=Object.assign(patches[id]||{},pend[id]);
+  const pids=pendIds(),byId=new Map(st.rows.map(r=>[r.id,r])),out=[];
+  srv.forEach((r,id)=>{
+    if(dels.has(id))return;fixRow(r);if(patches[id])Object.assign(r,patches[id]);
+    const loc=byId.get(id);if(loc&&loc._dirty)for(const k in loc._dirty)if(loc._dirty[k]>=ts)r[k]=loc[k];
+    out.push(r);
+  });
+  st.rows.forEach(r=>{if(!srv.has(r.id)&&!dels.has(r.id)&&(pids.has(r.id)||(r._born||0)>=ts))out.push(r)});
+  out.sort(byDefault);st.rows=out;invCopy();
+  if(lst){LISTS.forEach(c=>st.lst[c.k]=[]);lst.forEach(o=>{const v=UP(o.valor);if(st.lst[o.campo]&&v&&!st.lst[o.campo].includes(v))st.lst[o.campo].push(v)})}
+  st.srvTotal=isFull?res.total:Math.max(st.srvTotal||0,srv.size);st.srvRead=srv.size;
+  st.ok=true;online=true;$('#banner').className='banner';inval();setSave();renderAll();
+}
+async function doLoad(seq){
+  if(st.loading)render();conn('busy','Carregando últimos 7 dias...');
+  const t0=performance.now(),ts=Date.now();loadShow('Carregando últimos 7 dias...');
   try{
-    let [res,lst]=await Promise.all([fetchRegs(),keyset(T_LST,'select=id,campo,valor','id',null,null)]);
-    let srv=dedupe(res.rows);
-    if(srv.size!==res.total){res=await fetchRegs();srv=dedupe(res.rows)}
-    st.srvTotal=res.total;st.srvRead=srv.size;
-    if(srv.size!==res.total)toast(`Atenção: lidas ${srv.size} de ${res.total} linhas do banco (dados alterados durante a leitura). Clique em Atualizar.`,true);
-    const patches={},dels=new Set(GONE);
-    OUT.forEach(j=>{if(j.t==='patch')patches[j.id]=Object.assign(patches[j.id]||{},j.p);if(j.t==='del')dels.add(j.id)});
-    for(const id in pend)patches[id]=Object.assign(patches[id]||{},pend[id]);
-    const pids=pendIds(),byId=new Map(st.rows.map(r=>[r.id,r])),out=[];
-    srv.forEach((r,id)=>{
-      if(dels.has(id))return;
-      fixRow(r);if(patches[id])Object.assign(r,patches[id]);
-      const loc=byId.get(id);
-      if(loc&&loc._dirty)for(const k in loc._dirty)if(loc._dirty[k]>=ts)r[k]=loc[k];
-      out.push(r);
-    });
-    st.rows.forEach(r=>{if(!srv.has(r.id)&&!dels.has(r.id)&&(pids.has(r.id)||(r._born||0)>=ts))out.push(r)});
-    out.sort(byDefault);st.rows=out;invCopy();
-    LISTS.forEach(c=>st.lst[c.k]=[]);
-    lst.forEach(o=>{const v=UP(o.valor);if(st.lst[o.campo]&&v&&!st.lst[o.campo].includes(v))st.lst[o.campo].push(v)});
-    st.ok=true;online=true;$('#banner').className='banner';perf.load=Math.round(performance.now()-t0);
+    const [recent,lst]=await Promise.all([fetchRecentRegs(),keyset(T_LST,'select=id,campo,valor','id',null,null)]);
+    if(seq!==loadSeq)return;
+    /* IMPORTANTE: libera o estado de loading ANTES de renderizar.
+       Antes, applyServer() chamava renderAll() com st.loading=true e a tabela
+       continuava mostrando o esqueleto até o histórico completo terminar. */
+    st.loading=false;
+    applyServer(recent,lst,ts,false);
+    perf.load=Math.round(performance.now()-t0);
+    loadHide();
+
+    /* Garante que os últimos 7 dias sejam pintados na tabela antes da carga histórica. */
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    if(seq!==loadSeq)return;
+    conn('on',`Últimos 7 dias carregados · ${recent.rows.length} registro(s)`);
+
+    /* O restante só começa quando o navegador estiver livre, sem modal e sem bloquear a tabela. */
+    const startHistory=()=>{if(seq===loadSeq){conn('busy','Carregando histórico em segundo plano...');void loadHistory(seq,lst,ts)}};
+    if('requestIdleCallback' in window)requestIdleCallback(startHistory,{timeout:1800});
+    else setTimeout(startHistory,1200);
   }catch(e){
-    st.ok=false;
+    loadHide();st.loading=false;st.ok=false;
     if(e.net){online=false;clearTimeout(retryT);retryT=setTimeout(drain,10000)}
-    else{
-      conn('err','Erro');$('#bSqlB').style.display='';$('#bRetry').style.display='';
-      $('#bannerTx').textContent=(e.code==='42P01'||e.code==='PGRST205'||e.status===404)
-        ?'As tabelas "registro_operacional" e "registro_listas" não existem no Supabase. Execute o SQL de criação e clique em Tentar novamente.'
-        :'Falha ao carregar do Supabase: '+e.message;
-      $('#banner').className='banner show';
-    }
+    else{conn('err','Erro');$('#bSqlB').style.display='';$('#bRetry').style.display='';$('#bannerTx').textContent=(e.code==='42P01'||e.code==='PGRST205'||e.status===404)?'As tabelas "registro_operacional" e "registro_listas" não existem no Supabase. Execute o SQL de criação e clique em Tentar novamente.':'Falha ao carregar do Supabase: '+e.message;$('#banner').className='banner show'}
+    inval();setSave();renderAll();
   }
-  st.loading=false;inval();setSave();renderAll();
+}
+async function loadHistory(seq,lst,ts){
+  try{
+    let res=await fetchRegs();if(seq!==loadSeq)return;
+    let srv=dedupe(res.rows);
+    if(srv.size!==res.total){res=await fetchRegs();if(seq!==loadSeq)return;srv=dedupe(res.rows)}
+    applyServer(res,lst,ts,true);perf.load=Math.round(performance.now()-ts);
+    if(srv.size!==res.total)toast(`Atenção: lidas ${srv.size} de ${res.total} linhas do banco. Clique em Atualizar.`,true);
+    else toast(`Base completa carregada: ${srv.size} registro(s).`);
+  }catch(e){
+    if(seq!==loadSeq)return;
+    if(e.net){online=false;setSave();toast('Os últimos 7 dias foram carregados. O histórico continuará quando houver conexão.',true)}
+    else toast('Não foi possível completar o histórico: '+e.message,true);
+  }
 }
 const perf={load:0,render:0};
 let OPTC={};const inval=()=>{OPTC={}};
@@ -1107,11 +1172,11 @@ function newRow(){
 }
 $('#bNew').addEventListener('click',newRow);
 $('#bRef').addEventListener('click',async()=>{
-  flushAll();await drain();
+  flushAll();await withLoad('Sincronizando alterações...',()=>drain());
   if(pendingN()){toast('Sem conexão: as alterações pendentes serão enviadas quando o sinal voltar',true);return}
   load();
 });
-$('#bRetry').addEventListener('click',async()=>{await drain();if(!pendingN())load()});
+$('#bRetry').addEventListener('click',async()=>{await withLoad('Sincronizando alterações...',()=>drain());if(!pendingN())load()});
 
 /* ======================= POPOVERS ======================= */
 let POP=null;
@@ -1379,7 +1444,7 @@ function exportXlsx(){
   const sheets=[...g.keys()].sort(cmp).map(k=>({name:sheetSafe(k,used),header:COLS.map(c=>c.t),rows:g.get(k).map(rowCells),widths:COLS.map(c=>c.x),filter:true}));
   download(buildXlsx(sheets),`Registro_Operacional_${stamp()}.xlsx`);toast(`${rows.length} linha(s) em ${sheets.length} aba(s)`);
 }
-$('#bExp').addEventListener('click',exportXlsx);
+$('#bExp').addEventListener('click',()=>withLoad('Gerando Excel...',async()=>{await paint();exportXlsx()}));
 
 async function unzip(buf){
   const u=new Uint8Array(buf),dv=new DataView(buf);let e=-1;
@@ -1464,7 +1529,7 @@ function openImport(){
       <div id="impPv"></div><div id="impRun"></div>
     </div>
     <footer><button type="button" class="btn" data-close id="impCancel">Cancelar</button><button type="button" class="btn pri" id="bDoImp" disabled>Importar</button></footer>`,null,'min(860px,100%)');
-  $('#mTpl').addEventListener('click',()=>{downloadTemplate();$('#stpW').innerHTML=stepsHTML(2)});
+  $('#mTpl').addEventListener('click',()=>withLoad('Gerando modelo...',async()=>{await paint();downloadTemplate();$('#stpW').innerHTML=stepsHTML(2)}));
   const d=$('#drop');
   d.addEventListener('click',()=>$('#fImp').click());
   d.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('#fImp').click()}});
@@ -1475,7 +1540,8 @@ function openImport(){
 }
 $('#bImp').addEventListener('click',openImport);
 $('#fImp').addEventListener('change',e=>{const f=e.target.files[0];if(f)readFile(f);e.target.value=''});
-async function readFile(file){
+async function readFile(file){return withLoad('Lendo arquivo...',()=>readFile0(file))}
+async function readFile0(file){
   const pv=$('#impPv');if(pv)pv.innerHTML='<div class="note" style="background:var(--pl);color:var(--p)">Lendo arquivo...</div>';
   try{
     let sheets;
