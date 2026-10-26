@@ -644,7 +644,7 @@ async function api(path,opt={}){
 /* ======================= LEITURA FIEL =======================
    Paginação por CHAVE (num/id) em vez de OFFSET: edições, inserções ou exclusões
    feitas durante a leitura não deslocam páginas (causa de linhas duplicadas/faltando).
-   Funciona com qualquer limite "Max rows" do Supabase. */
+   Funciona com qualquer limite "Max rows" dos dados. */
 const PG=1000;
 async function keyset(t,sel,key,from,to){
   const out=[];let last=from;
@@ -660,7 +660,7 @@ async function keyset(t,sel,key,from,to){
   }
   return out;
 }
-async function fetchRegs(){
+async function fetchRegs(onProgress){
   try{
     const top=await api(`${T_REG}?select=num&order=num.desc&limit=1`,{raw:true,headers:{Prefer:'count=exact'}});
     const total=+((top.headers.get('content-range')||'').split('/')[1])||0;
@@ -669,8 +669,8 @@ async function fetchRegs(){
     const lo=await api(`${T_REG}?select=num&order=num.asc&limit=1`);
     const min=+(lo&&lo[0]?lo[0].num:1);
     const W=PG,wins=[];for(let a=min-1;a<max;a+=W)wins.push([a,Math.min(a+W,max)]);
-    const parts=new Array(wins.length);let nx=0;
-    const worker=async()=>{while(nx<wins.length){const i=nx++;parts[i]=await keyset(T_REG,SEL,'num',wins[i][0],wins[i][1])}};
+    const parts=new Array(wins.length);let nx=0,loaded=0;if(onProgress)onProgress(0,total);
+    const worker=async()=>{while(nx<wins.length){const i=nx++;parts[i]=await keyset(T_REG,SEL,'num',wins[i][0],wins[i][1]);loaded+=parts[i].length;if(onProgress)onProgress(Math.min(loaded,total),total)}};
     await Promise.all(Array.from({length:Math.min(4,wins.length)},worker));
     return {rows:parts.flat(),total};
   }catch(e){
@@ -843,22 +843,24 @@ async function doLoad(seq){
   try{
     const [recent,lst]=await Promise.all([fetchRecentRegs(),keyset(T_LST,'select=id,campo,valor','id',null,null)]);
     if(seq!==loadSeq)return;
-    applyServer(recent,lst,ts,false);st.loading=false;perf.load=Math.round(performance.now()-t0);loadHide();
-    conn('busy','Carregando histórico em segundo plano...');
-    /* Não aguardado de propósito: a tela fica liberada após os 7 dias. */
-    void loadHistory(seq,lst,ts);
+    st.loading=false;applyServer(recent,lst,ts,false);perf.load=Math.round(performance.now()-t0);loadHide();
+    await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));if(seq!==loadSeq)return;
+    conn('on',`Últimos 7 dias carregados · ${recent.rows.length} registro(s)`);
+    const startHistory=()=>{if(seq===loadSeq)void loadHistory(seq,lst,ts)};
+    if('requestIdleCallback' in window)requestIdleCallback(startHistory,{timeout:1800});else setTimeout(startHistory,1200);
   }catch(e){
     loadHide();st.loading=false;st.ok=false;
     if(e.net){online=false;clearTimeout(retryT);retryT=setTimeout(drain,10000)}
-    else{conn('err','Erro');$('#bSqlB').style.display='';$('#bRetry').style.display='';$('#bannerTx').textContent=(e.code==='42P01'||e.code==='PGRST205'||e.status===404)?'As tabelas "registro_operacional" e "registro_listas" não existem no banco. Execute o SQL de criação e clique em Tentar novamente.':'Falha ao carregar os dados: '+e.message;$('#banner').className='banner show'}
+    else{conn('err','Erro');$('#bSqlB').style.display='';$('#bRetry').style.display='';$('#bannerTx').textContent=(e.code==='42P01'||e.code==='PGRST205'||e.status===404)?'As tabelas "registro_operacional" e "registro_listas" não existem no banco. Execute o SQL de criação e clique em Tentar novamente.':'Falha ao carregar dos dados: '+e.message;$('#banner').className='banner show'}
     inval();setSave();renderAll();
   }
 }
+function historyProgress(done,total){const pct=total?Math.min(100,Math.round(done*100/total)):0;conn('busy',`Carregando dados em segundo plano · ${pct}%`);const f=$('#fInfo');if(f)f.textContent=`Exibindo ${st.rows.length.toLocaleString('pt-BR')} registro(s) · Carregamento em segundo plano: ${pct}%`}
 async function loadHistory(seq,lst,ts){
   try{
-    let res=await fetchRegs();if(seq!==loadSeq)return;
+    historyProgress(0,1);let res=await fetchRegs(historyProgress);if(seq!==loadSeq)return;
     let srv=dedupe(res.rows);
-    if(srv.size!==res.total){res=await fetchRegs();if(seq!==loadSeq)return;srv=dedupe(res.rows)}
+    if(srv.size!==res.total){res=await fetchRegs(historyProgress);if(seq!==loadSeq)return;srv=dedupe(res.rows)}
     applyServer(res,lst,ts,true);perf.load=Math.round(performance.now()-ts);
     if(srv.size!==res.total)toast(`Atenção: lidas ${srv.size} de ${res.total} linhas do banco. Clique em Atualizar.`,true);
     else toast(`Base completa carregada: ${srv.size} registro(s).`);
@@ -1137,7 +1139,7 @@ $('#tb').addEventListener('click',async e=>{
     st.rows.splice(idx+1,0,nr);invCopy();insertJob(nr);renderTabs();render();flash(nr.id);toast(online?'Linha duplicada':'Linha duplicada (será sincronizada quando houver sinal)');
     return;
   }
-  const ok=await confirmDel({title:'Excluir registro?',msg:'Esta ação remove a linha do banco e não pode ser desfeita.',ok:'Excluir registro',
+  const ok=await confirmDel({title:'Excluir registro?',msg:'Esta ação remove a linha dos dados e não pode ser desfeita.',ok:'Excluir registro',
     detail:[['ID',row.num!=null?'#'+row.num:'(aguardando sincronização)'],['Data',fmtD(row.data)||'—'],['Mina',row.mina||'—'],['Categoria',row.categoria||'—'],['Setores',row.setores||'—'],['Lançamento',row.lancamento||'—']]});
   if(!ok)return;
   delete pend[id];clearTimeout(timers[id]);GONE.add(id);
@@ -1313,7 +1315,7 @@ document.addEventListener('keydown',e=>{
   if($('#ov').classList.contains('show'))closeModal();else if($('#dw').classList.contains('show'))closeDrawer();
 });
 $('#bSqlB').addEventListener('click',()=>{
-  openModal(`<header><div><h2>SQL de criação</h2><p>Execute no editor SQL do banco.</p></div><button type="button" class="ib" data-close aria-label="Fechar">${I.x}</button></header>
+  openModal(`<header><div><h2>SQL de criação</h2><p>Execute em Supabase › SQL Editor › New query › Run</p></div><button type="button" class="ib" data-close aria-label="Fechar">${I.x}</button></header>
     <div class="bd"><pre class="sql">${esc(SQL)}</pre></div>
     <footer><button type="button" class="btn" id="cpSql">Copiar SQL</button><button type="button" class="btn pri" data-close>Fechar</button></footer>`);
   $('#cpSql').addEventListener('click',()=>navigator.clipboard.writeText(SQL).then(()=>toast('SQL copiado'),()=>toast('Não foi possível copiar',true)));
@@ -1527,23 +1529,19 @@ function openImport(){
 }
 $('#bImp').addEventListener('click',openImport);
 $('#fImp').addEventListener('change',e=>{const f=e.target.files[0];if(f)readFile(f);e.target.value=''});
-/* Assinatura de duplicidade: compara todos os campos de dados, ignorando ID e data de criação.
-   Textos são aparados, listas são normalizadas em maiúsculas e datas em ISO. */
+/* Compara todos os campos operacionais; ID e created_at não participam. */
 function dupSig(r){return FIELDS.map(k=>{
   let v=r[k];if(v==null)return '';
   if(k==='data')return String(v).slice(0,10);
   v=String(v).trim();
-  if(['mina','categoria','setores','lancamento'].includes(k))v=UP(v);
-  return v;
+  return ['mina','categoria','setores','lancamento'].includes(k)?UP(v):v;
 }).join('\u001f')}
-async function removeImportDuplicates(rows){
+async function checkImportDuplicates(rows){
   const unique=[],seen=new Set();let arquivo=0,banco=0;
-  for(const r of rows){const k=dupSig(r);if(seen.has(k)){arquivo++;continue}seen.add(k);unique.push(r)}
-  /* Busca a base completa no momento da conferência para não depender somente das linhas
-     que já estão visíveis na tabela enquanto o histórico carrega em segundo plano. */
-  const existing=await fetchRegs();
-  const db=new Set(existing.rows.map(dupSig));
-  const clean=[];for(const r of unique){if(db.has(dupSig(r)))banco++;else clean.push(r)}
+  for(const r of rows){const sig=dupSig(r);if(seen.has(sig)){arquivo++;continue}seen.add(sig);unique.push(r)}
+  /* Consulta a base completa para conferir também registros ainda não carregados na tela. */
+  const current=await fetchRegs(),existing=new Set(current.rows.map(dupSig)),clean=[];
+  for(const r of unique){if(existing.has(dupSig(r)))banco++;else clean.push(r)}
   return {rows:clean,arquivo,banco};
 }
 async function readFile(file){return withLoad('Lendo e verificando duplicidades...',()=>readFile0(file))}
@@ -1573,7 +1571,7 @@ async function readFile0(file){
         out.push(r);
       }
     });
-    const checked=await removeImportDuplicates(out);
+    const checked=await checkImportDuplicates(out);
     impRows=checked.rows;impDup={arquivo:checked.arquivo,banco:checked.banco};
     impName=file.name;showPreview(warn,bad);
   }catch(err){if(pv)pv.innerHTML='';toast('Erro ao ler arquivo: '+err.message,true)}
@@ -1584,12 +1582,9 @@ function showPreview(warn,bad){
   const sd=impRows.filter(r=>!r.data).length;
   $('#stpW').innerHTML=stepsHTML(impRows.length?3:2);
   pv.innerHTML=`<div class="tplc" style="margin:12px 0 0"><span class="fi" style="background:var(--p)">✓</span><div><b>${esc(impName)}</b><small>Arquivo lido com sucesso</small></div><button type="button" class="btn sm" id="impOther">Trocar arquivo</button></div>
-    <div class="kpis"><div class="kpi main"><b>${impRows.length.toLocaleString('pt-BR')}</b><span>linhas únicas para importar</span></div>
-      <div class="kpi ${impDup.arquivo?'bad':''}"><b>${impDup.arquivo.toLocaleString('pt-BR')}</b><span>duplicadas no arquivo</span></div>
-      <div class="kpi ${impDup.banco?'bad':''}"><b>${impDup.banco.toLocaleString('pt-BR')}</b><span>já existentes no banco</span></div>
-      ${Object.keys(g).sort(cmp).slice(0,7).map(k=>`<div class="kpi"><b>${g[k]}</b><span>${esc(k)}</span></div>`).join('')}</div>
+    <div class="kpis"><div class="kpi main"><b>${impRows.length.toLocaleString('pt-BR')}</b><span>linhas únicas para importar</span></div><div class="kpi ${impDup.arquivo?'bad':''}"><b>${impDup.arquivo.toLocaleString('pt-BR')}</b><span>duplicadas no arquivo</span></div><div class="kpi ${impDup.banco?'bad':''}"><b>${impDup.banco.toLocaleString('pt-BR')}</b><span>já existentes no banco</span></div>${Object.keys(g).sort(cmp).slice(0,7).map(k=>`<div class="kpi"><b>${g[k]}</b><span>${esc(k)}</span></div>`).join('')}</div>
     ${impRows.length?`<div class="pvw"><table class="pv"><thead><tr>${COLS.map(c=>`<th>${esc(c.t)}</th>`).join('')}</tr></thead><tbody>${impRows.slice(0,5).map(r=>`<tr>${COLS.map(c=>`<td title="${esc(r[c.k])}">${esc(c.type==='date'?fmtD(r[c.k]):r[c.k])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`:''}
-    ${(impDup.arquivo||impDup.banco)?`<div class="note">⚠ ${impDup.arquivo+impDup.banco} registro(s) duplicado(s) foram retirados da importação. A comparação considera todos os campos da linha.</div>`:''}
+    ${(impDup.arquivo||impDup.banco)?`<div class="note">⚠ ${(impDup.arquivo+impDup.banco).toLocaleString('pt-BR')} registro(s) duplicado(s) foram retirados da importação.</div>`:''}
     ${bad?`<div class="note">⚠ ${bad} data(s) em formato inválido serão importadas em branco.</div>`:sd?`<div class="note">⚠ ${sd} linha(s) sem DATA serão importadas sem data.</div>`:''}
     ${!impRows.length?'<div class="note">⚠ Nenhuma linha preenchida foi encontrada.</div>':''}
     ${warn.map(w=>`<div class="note">⚠ ${esc(w)}</div>`).join('')}`;
@@ -1654,7 +1649,7 @@ function showResult(res){
     ${pn?`<div class="kpi bad"><b>${pn}</b><span>não enviadas (cancelado)</span></div>`:''}
     <div class="kpi"><b>${sec}s</b><span>tempo total</span></div></div>
     ${res.fail.length?`<div class="note">⚠ ${res.fail.length} linha(s) foram recusadas pelo banco. Baixe, corrija e importe novamente.<button type="button" class="btn sm" id="dlErr" style="margin-left:auto">${I.dl}Baixar linhas com erro</button></div>`:''}`;
-  $('#impX').style.visibility='';impRows=[];impDup={arquivo:0,banco:0};
+  $('#impX').style.visibility='';impRows=[];
   const b=$('#bDoImp'),nb=b.cloneNode(false);nb.className='btn pri';nb.textContent='Concluir';nb.disabled=false;b.replaceWith(nb);
   nb.addEventListener('click',()=>closeModal(true));
   if(res.fail.length)$('#dlErr').addEventListener('click',()=>{
